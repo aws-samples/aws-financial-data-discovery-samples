@@ -1,0 +1,449 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Automate the archival and deletion of sensitive financial data using Amazon Macie
+Transform: "AWS::Serverless-2016-10-31"
+
+Metadata:
+  "AWS::CloudFormation::Interface":
+    ParameterGroups:
+      - Label:
+          default: "Source S3 Bucket"
+        Parameters:
+          - SourceBucketName
+          - SourceBucketRetention
+      - Label:
+          default: "Severity Tagging"
+        Parameters:
+          - TagKey
+          - SeverityThreshold
+      - Label:
+          default: "Lifecycle Options"
+        Parameters:
+          - GlacierTransitionInDays
+          - ExpireObjectsInDays
+
+Parameters:
+  TagKey:
+    Type: String
+    Description: Tag key to use when tagging S3 object finding severity
+    Default: Severity
+  SeverityThreshold:
+    Type: String
+    Description: Scoring threshold to tag S3 objects
+    Default: High
+    AllowedValues:
+      - Low
+      - Medium
+      - High
+  SourceBucketName:
+    Type: String
+    Description: Optional S3 bucket containing potentially sensitive content (if not provided, a bucket will be created)
+    Default: ""
+  SourceBucketRetention:
+    Type: Number
+    Description: If creating a source bucket, what is the default object retention (in days). Set to zero to disable.
+    Default: 0
+    MinValue: 0
+  GlacierTransitionInDays:
+    Type: Number
+    Description: Number of days until objects are transitioned to Glacier
+    Default: 365 # 1 year
+  ExpireObjectsInDays:
+    Type: Number
+    Description: Number of days until objects permanently expire
+    Default: 1825 # 5 years
+
+Conditions:
+  CreateSourceBucket: !Equals [!Ref SourceBucketName, ""]
+  HasRetention: !And
+    - !Condition CreateSourceBucket
+    - !Not [!Equals [!Ref SourceBucketRetention, 0]]
+
+Rules:
+  ValidateTagKey:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref "TagKey", ""]]
+        AssertDescription: Tag key must be provided
+
+Mappings:
+  # @see https://docs.aws.amazon.com/macie/latest/user/findings-severity.html
+  SeverityMap:
+    Low:
+      Score: 1
+    Medium:
+      Score: 2
+    High:
+      Score: 3
+
+Globals:
+  Function:
+    Environment:
+      Variables:
+        LOG_LEVEL: DEBUG
+        LAMBDA_INSIGHTS_LOG_LEVEL: WARN
+        POWERTOOLS_METRICS_NAMESPACE: FinancialMacieAnalyzer
+    Handler: lambda_handler.handler
+    Layers:
+      - !Ref DependencyLayer
+    MemorySize: 128 # megabytes
+    Runtime: python3.8
+    Timeout: 10 # seconds
+
+Resources:
+  DependencyLayer:
+    Type: "AWS::Serverless::LayerVersion"
+    Metadata:
+      BuildMethod: python3.8
+    Properties:
+      ContentUri: dependencies
+      CompatibleRuntimes:
+        - python3.8
+      RetentionPolicy: Delete
+
+  SourceBucket:
+    Type: "AWS::S3::Bucket"
+    Condition: CreateSourceBucket
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"
+      LifecycleConfiguration: !If
+        - HasRetention
+        - Rules:
+          - AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+            ExpirationInDays: !Ref SourceBucketRetention
+            ExpiredObjectDeleteMarker: true
+            Id: RetentionRule
+            NoncurrentVersionExpirationInDays: !Ref SourceBucketRetention
+            Status: Enabled
+        - !Ref "AWS::NoValue"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  SourceBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Condition: CreateSourceBucket
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SourceBucket.Arn
+              - !Sub "${SourceBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  ResultsBucket:
+    Type: "AWS::S3::Bucket"
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  ResultsBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref ResultsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ResultsBucket.Arn
+              - !Sub "${ResultsBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  ResultsNotifications:
+    Type: "Custom::S3BucketNotifications"
+    DependsOn: BucketNotificationCloudWatchPolicy
+    Properties:
+      ServiceToken: !GetAtt BucketNotificationFunction.Arn
+      BucketName: !Ref ResultsBucket
+      NotificationConfiguration:
+        LambdaFunctionConfigurations:
+          - Events:
+              - "s3:ObjectCreated:*"
+            LambdaFunctionArn: !GetAtt MacieFunction.Arn
+
+  BucketNotificationPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt MacieFunction.Arn
+      Principal: "s3.amazonaws.com"
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !GetAtt ResultsBucket.Arn
+
+  BucketNotificationLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${BucketNotificationFunction}"
+      RetentionInDays: 3
+
+  BucketNotificationFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Description: !Sub "DO NOT DELETE - Used by Lambda. Created by ${AWS::StackId}"
+      Policies:
+        - PolicyName: BucketNotificationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "s3:PutBucketNotification"
+                Resource: !GetAtt ResultsBucket.Arn
+
+  BucketNotificationCloudWatchPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: CloudWatchLogs
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !GetAtt BucketNotificationLogGroup.Arn
+      Roles:
+        - !Ref BucketNotificationFunctionRole
+
+  BucketNotificationFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: src/s3-events
+      Description: Add a bucket notification to the results bucket
+      Role: !GetAtt BucketNotificationFunctionRole.Arn
+
+  MacieFunctionLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${MacieFunction}"
+      RetentionInDays: 3
+
+  MacieFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Description: !Sub "DO NOT DELETE - Used by Lambda. Created by ${AWS::StackId}"
+      Policies:
+        - PolicyName: MacieFunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                Resource: !Sub "${ResultsBucket.Arn}/*"
+              - Effect: Allow
+                Action: "s3:ListBucket"
+                Resource: !GetAtt ResultsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - "s3:PutObjectTagging"
+                  - "s3:PutObjectVersionTagging"
+                Resource: !If
+                  - CreateSourceBucket
+                  - !Sub "${SourceBucket.Arn}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${SourceBucketName}/*"
+              - Effect: Allow
+                Action: "s3:PutLifecycleConfiguration"
+                Resource: !If
+                  - CreateSourceBucket
+                  - !GetAtt SourceBucket.Arn
+                  - !Sub "arn:${AWS::Partition}:s3:::${SourceBucketName}"
+
+  MacieCloudWatchPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: CloudWatchLogs
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !GetAtt MacieFunctionLogGroup.Arn
+      Roles:
+        - !Ref MacieFunctionRole
+
+  MacieFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: "src/eventbridge-macie"
+      Description: Apply lifecycle policies and object tags to sensitive financial data
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: eventbridge-macie
+          TAG_KEY_NAME: !Ref TagKey
+          SCORE_THRESHOLD: !FindInMap [SeverityMap, !Ref SeverityThreshold, Score]
+          GLACIER_TRANSITION_DAYS: !Ref GlacierTransitionInDays
+          EXPIRE_OBJECTS_DAYS: !Ref ExpireObjectsInDays
+      Role: !GetAtt MacieFunctionRole.Arn
+
+  FirehoseLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/aws/kinesisfirehose/${AWS::StackName}"
+      RetentionInDays: 3
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "events.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Description: !Sub "DO NOT DELETE - Used by EventBridge. Created by ${AWS::StackId}"
+
+  EventBridgePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: KinesisFirehose
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "firehose:PutRecord"
+              - "firehose:PutRecordBatch"
+            Resource: !GetAtt MacieResultsFirehose.Arn
+      Roles:
+        - !Ref EventBridgeRole
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "firehose.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Description: !Sub "DO NOT DELETE - Used by Kinesis Firehose. Created by ${AWS::StackId}"
+      Policies:
+        - PolicyName: FirehosePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetBucketLocation"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                Resource: !GetAtt ResultsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - "s3:AbortMultipartUpload"
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource: !Sub "${ResultsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !GetAtt FirehoseLogGroup.Arn
+
+  MacieResultsFirehose:
+    Type: "AWS::KinesisFirehose::DeliveryStream"
+    DependsOn: FirehoseLogGroup
+    Properties:
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt ResultsBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 60 #300
+          SizeInMBs: 1 #5
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub "/aws/kinesisfirehose/${AWS::StackName}"
+          LogStreamName: S3Delivery
+        RoleARN: !GetAtt FirehoseRole.Arn
+
+  MacieEventsRule:
+    Type: "AWS::Events::Rule"
+    DependsOn: EventBridgePolicy
+    Properties:
+      EventPattern:
+        detail-type:
+          - Macie Finding
+        source:
+          - "aws.macie"
+        detail:
+          type:
+            - "SensitiveData:S3Object/Financial"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MacieResultsFirehose.Arn
+          Id: MacieFirehose
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+Outputs:
+  SourceBucket:
+    Value: !Ref SourceBucket
+    Description: Source S3 Bucket
+    Condition: CreateSourceBucket
+  ResultsBucket:
+    Value: !Ref ResultsBucket
+    Description: Macie results S3 Bucket
