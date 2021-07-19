@@ -15,7 +15,7 @@
 
 ## Introduction
 
-This project provides an example using Amazon Macie to discovery sensitive financial data stored in an Amazon S3 bucket. The S3 object data will be automatically tagged and an S3 bucket lifecycle policy will be applied to transition the objects into Amazon Glacier.
+This project provides an example using Amazon Macie to discovery [sensitive financial](https://docs.aws.amazon.com/macie/latest/user/managed-data-identifiers.html#managed-data-identifiers-financial) data stored in an Amazon S3 bucket. The S3 object data will be automatically tagged and an S3 bucket lifecycle policy will be applied to transition the objects into Amazon Glacier.
 
 ## Architecture
 
@@ -59,8 +59,8 @@ This project provides an example using Amazon Macie to discovery sensitive finan
 #### Installation
 
 ```
-git clone https://github.com/aws-samples/aws-financial-data-discovery
-cd aws-financial-data-discovery
+git clone https://github.com/aws-samples/aws-financial-data-discovery-samples
+cd aws-financial-data-discovery-samples
 sam build
 sam deploy --guided
 ```
@@ -71,7 +71,7 @@ Please refer to the [Amazon Macie Pricing](https://aws.amazon.com/macie/pricing/
 
 ## Clean up
 
-Deleting the CloudFormation Stack will remove the Lambda functions, Kinesis Data Firehose and EventBridge rules. Ensure the S3 buckets are empty before attempting to remove them.
+Deleting the CloudFormation Stack will remove the Lambda functions, Kinesis Data Firehose and EventBridge rule. Ensure the S3 buckets are empty before attempting to remove them.
 
 ## Reference
 
