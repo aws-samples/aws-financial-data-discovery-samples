@@ -10,7 +10,7 @@
 6. [Cost Estimate](#cost-estimate)
 7. [Clean up](#clean-up)
 8. [Reference](#reference)
-9. [Contributing](#security)
+9. [Security](#security)
 10. [License](#license)
 
 ## Introduction
