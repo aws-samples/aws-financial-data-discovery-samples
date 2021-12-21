@@ -154,7 +154,7 @@ Resources:
               - !Sub "${SourceBucket.Arn}/*"
             Condition:
               Bool:
-                "aws:SecureTransport": "false"
+                "aws:SecureTransport": false
 
   ResultsBucket:
     Type: "AWS::S3::Bucket"
@@ -194,7 +194,7 @@ Resources:
               - !Sub "${ResultsBucket.Arn}/*"
             Condition:
               Bool:
-                "aws:SecureTransport": "false"
+                "aws:SecureTransport": false
 
   ResultsNotifications:
     Type: "Custom::S3BucketNotifications"
